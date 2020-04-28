@@ -458,6 +458,10 @@ func (c *gcControllerState) startCycle() {
 		p.gcAssistTime = 0
 		p.gcFractionalMarkTime = 0
 	}
+	for _, p := range allp2 {
+		p.gcAssistTime = 0
+		p.gcFractionalMarkTime = 0
+	}
 
 	// Compute initial values for controls that are updated
 	// throughout the cycle.
@@ -1263,6 +1267,12 @@ func gcStart(trigger gcTrigger) {
 			throw("p mcache not flushed")
 		}
 	}
+	for _, p := range allp2 {
+		if fg := atomic.Load(&p.mcache.flushGen); fg != mheap_.sweepgen {
+			println("runtime: p", p.id, "flushGen", fg, "!= sweepgen", mheap_.sweepgen)
+			throw("p mcache not flushed")
+		}
+	}
 
 	gcBgMarkStartWorkers()
 
@@ -1528,6 +1538,28 @@ top:
 				throw("throwOnGCWork")
 			}
 		}
+		for _, p := range allp2 {
+			gcw := &p.gcw
+			if !gcw.empty() {
+				printlock()
+				print("runtime: P ", p.id, " flushedWork ", gcw.flushedWork)
+				if gcw.wbuf1 == nil {
+					print(" wbuf1=<nil>")
+				} else {
+					print(" wbuf1.n=", gcw.wbuf1.nobj)
+				}
+				if gcw.wbuf2 == nil {
+					print(" wbuf2=<nil>")
+				} else {
+					print(" wbuf2.n=", gcw.wbuf2.nobj)
+				}
+				print("\n")
+				if gcw.pauseGen == gcw.putGen {
+					println("runtime: checkPut already failed at this generation")
+				}
+				throw("throwOnGCWork")
+			}
+		}
 	} else {
 		// For unknown reasons (see issue #27993), there is
 		// sometimes work left over when we enter mark
@@ -1540,6 +1572,13 @@ top:
 		restart := false
 		systemstack(func() {
 			for _, p := range allp {
+				wbBufFlush1(p)
+				if !p.gcw.empty() {
+					restart = true
+					break
+				}
+			}
+			for _, p := range allp2 {
 				wbBufFlush1(p)
 				if !p.gcw.empty() {
 					restart = true
@@ -1789,6 +1828,7 @@ func gcMarkTermination(nextTriggerRatio float64) {
 func gcBgMarkStartWorkers() {
 	// Background marking is performed by per-P G's. Ensure that
 	// each P has a background GC G.
+	// TODO: support allp2
 	for _, p := range allp {
 		if p.gcBgMarkWorker == 0 {
 			go gcBgMarkWorker(p)
@@ -2035,6 +2075,43 @@ func gcMark(start_time int64) {
 	// TODO: We could clear out buffers just before mark if this
 	// has a non-negligible impact on STW time.
 	for _, p := range allp {
+		// The write barrier may have buffered pointers since
+		// the gcMarkDone barrier. However, since the barrier
+		// ensured all reachable objects were marked, all of
+		// these must be pointers to black objects. Hence we
+		// can just discard the write barrier buffer.
+		if debug.gccheckmark > 0 || throwOnGCWork {
+			// For debugging, flush the buffer and make
+			// sure it really was all marked.
+			wbBufFlush1(p)
+		} else {
+			p.wbBuf.reset()
+		}
+
+		gcw := &p.gcw
+		if !gcw.empty() {
+			printlock()
+			print("runtime: P ", p.id, " flushedWork ", gcw.flushedWork)
+			if gcw.wbuf1 == nil {
+				print(" wbuf1=<nil>")
+			} else {
+				print(" wbuf1.n=", gcw.wbuf1.nobj)
+			}
+			if gcw.wbuf2 == nil {
+				print(" wbuf2=<nil>")
+			} else {
+				print(" wbuf2.n=", gcw.wbuf2.nobj)
+			}
+			print("\n")
+			throw("P has cached GC work at end of mark termination")
+		}
+		// There may still be cached empty buffers, which we
+		// need to flush since we're going to free them. Also,
+		// there may be non-zero stats because we allocated
+		// black after the gcMarkDone barrier.
+		gcw.dispose()
+	}
+	for _, p := range allp2 {
 		// The write barrier may have buffered pointers since
 		// the gcMarkDone barrier. However, since the barrier
 		// ensured all reachable objects were marked, all of

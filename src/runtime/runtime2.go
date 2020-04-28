@@ -491,6 +491,7 @@ type m struct {
 	schedlink     muintptr
 	mcache        *mcache
 	lockedg       guintptr
+	lockedp       puintptr
 	createstack   [32]uintptr // stack that created this thread.
 	lockedExt     uint32      // tracking for external LockOSThread
 	lockedInt     uint32      // tracking for internal lockOSThread
@@ -528,6 +529,7 @@ type p struct {
 	syscalltick uint32     // incremented on every system call
 	sysmontick  sysmontick // last tick observed by sysmon
 	m           muintptr   // back-link to associated m (nil if idle)
+	lockedm     muintptr
 	mcache      *mcache
 	raceprocctx uintptr
 
@@ -621,6 +623,8 @@ type schedt struct {
 
 	ngsys uint32 // number of system goroutines; updated atomically
 
+	pidle3     puintptr
+	pidle2     puintptr
 	pidle      puintptr // idle p's
 	npidle     uint32
 	nmspinning uint32 // See "Worker thread parking/unparking" comment in proc.go.
@@ -912,8 +916,13 @@ var (
 	allglen    uintptr
 	allm       *m
 	allp       []*p  // len(allp) == gomaxprocs; may change at safe points, otherwise immutable
+	allp2      []*p  // len(allp2) == totalprocs - gomaxprocs;
+	allp2updating uint32
 	allpLock   mutex // Protects P-less reads of allp and all writes
 	gomaxprocs int32
+	_gomaxprocs int32 = 8 // XXX
+	totalprocs  int32
+	ntotalprocs int32
 	ncpu       int32
 	forcegc    forcegcstate
 	sched      schedt

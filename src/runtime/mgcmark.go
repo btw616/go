@@ -1361,6 +1361,15 @@ func gcMarkTinyAllocs() {
 		gcw := &p.gcw
 		greyobject(c.tiny, 0, 0, span, gcw, objIndex)
 	}
+	for _, p := range allp2 {
+		c := p.mcache
+		if c == nil || c.tiny == 0 {
+			continue
+		}
+		_, span, objIndex := findObject(c.tiny, 0, 0)
+		gcw := &p.gcw
+		greyobject(c.tiny, 0, 0, span, gcw, objIndex)
+	}
 }
 
 // Checkmarking

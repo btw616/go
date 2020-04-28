@@ -593,6 +593,13 @@ func cachestats() {
 		}
 		purgecachedstats(c)
 	}
+	for _, p := range allp2 {
+		c := p.mcache
+		if c == nil {
+			continue
+		}
+		purgecachedstats(c)
+	}
 }
 
 // flushmcache flushes the mcache of allp[i].
@@ -601,7 +608,12 @@ func cachestats() {
 //
 //go:nowritebarrier
 func flushmcache(i int) {
-	p := allp[i]
+	var p *p
+	if i >= int(_gomaxprocs) {
+		p = allp2[i]
+	} else {
+		p = allp[i]
+	}
 	c := p.mcache
 	if c == nil {
 		return
@@ -616,7 +628,7 @@ func flushmcache(i int) {
 //
 //go:nowritebarrier
 func flushallmcaches() {
-	for i := 0; i < int(gomaxprocs); i++ {
+	for i := 0; i < int(totalprocs); i++ {
 		flushmcache(i)
 	}
 }

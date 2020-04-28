@@ -560,6 +560,8 @@ func schedinit() {
 	if n, ok := atoi32(gogetenv("GOMAXPROCS")); ok && n > 0 {
 		procs = n
 	}
+	procs = _gomaxprocs // XXX
+	totalprocs = procs
 	if procresize(procs) != nil {
 		throw("unknown runnable goroutine during bootstrap")
 	}
@@ -661,7 +663,14 @@ func ready(gp *g, traceskip int, next bool) {
 
 	// status is Gwaiting or Gscanwaiting, make Grunnable and put on runq
 	casgstatus(gp, _Gwaiting, _Grunnable)
-	runqput(_g_.m.p.ptr(), gp, next)
+	_p_ := _g_.m.p.ptr()
+	if _p_.lockedm != 0 {
+		lock(&sched.lock)
+		globrunqputhead(gp)
+		unlock(&sched.lock)
+	} else {
+		runqput(_p_, gp, next)
+	}
 	if atomic.Load(&sched.npidle) != 0 && atomic.Load(&sched.nmspinning) == 0 {
 		wakep()
 	}
@@ -1011,7 +1020,7 @@ func stopTheWorldWithSema() {
 	}
 
 	lock(&sched.lock)
-	sched.stopwait = gomaxprocs
+	sched.stopwait = totalprocs
 	atomic.Store(&sched.gcwaiting, 1)
 	preemptall()
 	// stop current P
@@ -1029,12 +1038,39 @@ func stopTheWorldWithSema() {
 			sched.stopwait--
 		}
 	}
+	for _, p := range allp2 {
+		s := p.status
+		if s == _Psyscall && atomic.Cas(&p.status, s, _Pgcstop) {
+			if trace.enabled {
+				traceGoSysBlock(p)
+				traceProcStop(p)
+			}
+			p.syscalltick++
+			sched.stopwait--
+		}
+	}
 	// stop idle P's
 	for {
 		p := pidleget()
 		if p == nil {
 			break
 		}
+		p.status = _Pgcstop
+		sched.stopwait--
+	}
+	for {
+		p := pidleget2()
+		if p == nil {
+			break
+		}
+		p.status = _Pgcstop
+		sched.stopwait--
+	}
+	for {
+		if sched.pidle3 == 0 {
+			break
+		}
+		p := pidleget3(sched.pidle3.ptr())
 		p.status = _Pgcstop
 		sched.stopwait--
 	}
@@ -1056,10 +1092,18 @@ func stopTheWorldWithSema() {
 	// sanity checks
 	bad := ""
 	if sched.stopwait != 0 {
+		print("stopTheWorld: sched.stopwait=", sched.stopwait, "\n")
 		bad = "stopTheWorld: not stopped (stopwait != 0)"
 	} else {
 		for _, p := range allp {
 			if p.status != _Pgcstop {
+				print("stopTheWorld: p.status=", p.status, " p.id=", p.id, "\n")
+				bad = "stopTheWorld: not stopped (status != _Pgcstop)"
+			}
+		}
+		for _, p := range allp2 {
+			if p.status != _Pgcstop {
+				print("stopTheWorld: p.status=", p.status, " p.id=", p.id, "\n")
 				bad = "stopTheWorld: not stopped (status != _Pgcstop)"
 			}
 		}
@@ -1239,6 +1283,10 @@ func mexit(osStack bool) {
 	g := getg()
 	m := g.m
 
+	if m.lockedp != 0 {
+		throw("mexit: m is locked, not supported yet")
+	}
+
 	if m == &m0 {
 		// This is the main thread. Just wedge it.
 		//
@@ -1337,11 +1385,16 @@ func forEachP(fn func(*p)) {
 	if sched.safePointWait != 0 {
 		throw("forEachP: sched.safePointWait != 0")
 	}
-	sched.safePointWait = gomaxprocs - 1
+	sched.safePointWait = totalprocs - 1
 	sched.safePointFn = fn
 
 	// Ask all Ps to run the safe point function.
 	for _, p := range allp {
+		if p != _p_ {
+			atomic.Store(&p.runSafePointFn, 1)
+		}
+	}
+	for _, p := range allp2 {
 		if p != _p_ {
 			atomic.Store(&p.runSafePointFn, 1)
 		}
@@ -1360,6 +1413,18 @@ func forEachP(fn func(*p)) {
 			sched.safePointWait--
 		}
 	}
+	for p := sched.pidle2.ptr(); p != nil; p = p.link.ptr() {
+		if atomic.Cas(&p.runSafePointFn, 1, 0) {
+			fn(p)
+			sched.safePointWait--
+		}
+	}
+	for p := sched.pidle3.ptr(); p != nil; p = p.link.ptr() {
+		if atomic.Cas(&p.runSafePointFn, 1, 0) {
+			fn(p)
+			sched.safePointWait--
+		}
+	}
 
 	wait := sched.safePointWait > 0
 	unlock(&sched.lock)
@@ -1370,6 +1435,17 @@ func forEachP(fn func(*p)) {
 	// Force Ps currently in _Psyscall into _Pidle and hand them
 	// off to induce safe point function execution.
 	for _, p := range allp {
+		s := p.status
+		if s == _Psyscall && p.runSafePointFn == 1 && atomic.Cas(&p.status, s, _Pidle) {
+			if trace.enabled {
+				traceGoSysBlock(p)
+				traceProcStop(p)
+			}
+			p.syscalltick++
+			handoffp(p)
+		}
+	}
+	for _, p := range allp2 {
 		s := p.status
 		if s == _Psyscall && p.runSafePointFn == 1 && atomic.Cas(&p.status, s, _Pidle) {
 			if trace.enabled {
@@ -1399,6 +1475,11 @@ func forEachP(fn func(*p)) {
 		throw("forEachP: not done")
 	}
 	for _, p := range allp {
+		if p.runSafePointFn != 0 {
+			throw("forEachP: P did not run fn")
+		}
+	}
+	for _, p := range allp2 {
 		if p.runSafePointFn != 0 {
 			throw("forEachP: P did not run fn")
 		}
@@ -1921,6 +2002,9 @@ func stopm() {
 	if _g_.m.spinning {
 		throw("stopm spinning")
 	}
+	if _g_.m.lockedp != 0 {
+		throw("stopm: m is locked")
+	}
 
 	lock(&sched.lock)
 	mput(_g_.m)
@@ -1990,6 +2074,37 @@ func startm(_p_ *p, spinning bool) {
 func handoffp(_p_ *p) {
 	// handoffp must start an M in any situation where
 	// findrunnable would return a G to run on _p_.
+
+	if _p_.lockedm != 0 {
+		if !runqempty(_p_) {
+			throw("handoffp: p has runnable gs")
+		}
+		lock(&sched.lock)
+		if sched.gcwaiting != 0 {
+			_p_.status = _Pgcstop
+			sched.stopwait--
+			if sched.stopwait == 0 {
+				notewakeup(&sched.stopnote)
+			}
+			unlock(&sched.lock)
+			return
+		}
+		if _p_.runSafePointFn != 0 && atomic.Cas(&_p_.runSafePointFn, 1, 0) {
+			sched.safePointFn(_p_)
+			sched.safePointWait--
+			if sched.safePointWait == 0 {
+				notewakeup(&sched.safePointNote)
+			}
+		}
+		pidleput3(_p_)
+		unlock(&sched.lock)
+		return
+	}
+
+	if _p_.id >= _gomaxprocs {
+		print("handoffp: p should be locked. p.id=", _p_.id, "\n")
+		throw("handoffp: p should be locked")
+	}
 
 	// if it has local work, start it straight away
 	if !runqempty(_p_) || sched.runqsize != 0 {
@@ -2090,6 +2205,32 @@ func startlockedm(gp *g) {
 	if mp.nextp != 0 {
 		throw("startlockedm: m has p")
 	}
+	if _g_.m.lockedp != 0 || _g_.m.p.ptr().lockedm != 0 {
+		throw("startlockedm: I'm locked")
+	}
+
+	if mp.lockedp != 0 {
+		_p_ := mp.lockedp.ptr()
+		for {
+			lock(&sched.lock)
+			pp := pidleget3(_p_)
+			if pp != nil {
+				unlock(&sched.lock)
+				break
+			}
+			if sched.gcwaiting != 0 {
+				globrunqput(gp)
+				unlock(&sched.lock)
+				return
+			}
+			unlock(&sched.lock)
+		}
+		incidlelocked(-1)
+		mp.nextp.set(_p_)
+		notewakeup(&mp.park)
+		return
+	}
+
 	// directly handoff current P to the locked m
 	incidlelocked(-1)
 	_p_ := releasep()
@@ -2404,7 +2545,7 @@ func pollWork() bool {
 	if !runqempty(p) {
 		return true
 	}
-	if netpollinited() && atomic.Load(&netpollWaiters) > 0 && sched.lastpoll != 0 {
+	if p.lockedm == 0 && netpollinited() && atomic.Load(&netpollWaiters) > 0 && sched.lastpoll != 0 {
 		if list := netpoll(false); !list.empty() {
 			injectglist(&list)
 			return true
@@ -2470,6 +2611,10 @@ func schedule() {
 		execute(_g_.m.lockedg.ptr(), false) // Never returns.
 	}
 
+	if _g_.m.lockedp != 0 || _g_.m.p.ptr().lockedm != 0 {
+		throw("schedule: m/p is locked")
+	}
+
 	// We should not schedule away from a g that is executing a cgo call,
 	// since the cgo call is using the m's g0 stack.
 	if _g_.m.incgo {
@@ -2516,9 +2661,9 @@ top:
 	}
 	if gp == nil {
 		gp, inheritTime = runqget(_g_.m.p.ptr())
-		if gp != nil && _g_.m.spinning {
-			throw("schedule: spinning with local work")
-		}
+		//if gp != nil && _g_.m.spinning {
+		//	throw("schedule: spinning with local work")
+		//}
 	}
 	if gp == nil {
 		gp, inheritTime = findrunnable() // blocks until work is available
@@ -2532,6 +2677,7 @@ top:
 	}
 
 	if sched.disable.user && !schedEnabled(gp) {
+		throw("schedule: !schedEnabled()")
 		// Scheduling of this goroutine is disabled. Put it on
 		// the list of pending runnable goroutines for when we
 		// re-enable user scheduling and look again.
@@ -2815,6 +2961,7 @@ func reentersyscall(pc, sp uintptr) {
 	}
 
 	if trace.enabled {
+		throw("reentersyscall: trace not supported")
 		systemstack(traceGoSysCall)
 		// systemstack itself clobbers g.sched.{pc,sp} and we might
 		// need them later when the G is genuinely blocked in a
@@ -3047,7 +3194,7 @@ func exitsyscallfast(oldp *p) bool {
 	}
 
 	// Try to get any other idle P.
-	if sched.pidle != 0 {
+	if (_g_.m.lockedp == 0 && sched.pidle != 0) || (_g_.m.lockedp != 0 && sched.pidle3 != 0) {
 		var ok bool
 		systemstack(func() {
 			ok = exitsyscallfast_pidle()
@@ -3093,11 +3240,17 @@ func exitsyscallfast_reacquired() {
 }
 
 func exitsyscallfast_pidle() bool {
+	_g_ := getg()
+	var _p_ *p
 	lock(&sched.lock)
-	_p_ := pidleget()
-	if _p_ != nil && atomic.Load(&sched.sysmonwait) != 0 {
-		atomic.Store(&sched.sysmonwait, 0)
-		notewakeup(&sched.sysmonnote)
+	if _g_.m.lockedp == 0 {
+		_p_ = pidleget()
+		if _p_ != nil && atomic.Load(&sched.sysmonwait) != 0 {
+			atomic.Store(&sched.sysmonwait, 0)
+			notewakeup(&sched.sysmonnote)
+		}
+	} else {
+		_p_ = pidleget3(_g_.m.lockedp.ptr())
 	}
 	unlock(&sched.lock)
 	if _p_ != nil {
@@ -3118,7 +3271,7 @@ func exitsyscall0(gp *g) {
 	dropg()
 	lock(&sched.lock)
 	var _p_ *p
-	if schedEnabled(_g_) {
+	if _g_.m.lockedp == 0 && schedEnabled(_g_) {
 		_p_ = pidleget()
 	}
 	if _p_ == nil {
@@ -3357,7 +3510,13 @@ func newproc1(fn *funcval, argp *uint8, narg int32, callergp *g, callerpc uintpt
 	if trace.enabled {
 		traceGoCreate(newg, newg.startpc)
 	}
-	runqput(_p_, newg, true)
+	if _p_.lockedm != 0 || true {
+		lock(&sched.lock)
+		globrunqputhead(newg)
+		unlock(&sched.lock)
+	} else {
+		runqput(_p_, newg, true)
+	}
 
 	if atomic.Load(&sched.npidle) != 0 && atomic.Load(&sched.nmspinning) == 0 && mainStarted {
 		wakep()
@@ -3511,6 +3670,126 @@ func dolockOSThread() {
 	_g_ := getg()
 	_g_.m.lockedg.set(_g_)
 	_g_.lockedm.set(_g_.m)
+}
+
+func DedicateOSThread() {
+	if atomic.Load(&newmHandoff.haveTemplateThread) == 0 && GOOS != "plan9" {
+		// If we need to start a new thread from the locked
+		// thread, we need the template thread. Start it now
+		// while we're in a known-good state.
+		startTemplateThread()
+	}
+
+again:
+	_g_ := getg()
+
+	lock(&sched.lock)
+	newp := pidleget2()
+	if newp == nil {
+		if sched.gcwaiting != 0 {
+			unlock(&sched.lock)
+			Gosched()
+		} else {
+			unlock(&sched.lock)
+			if atomic.Cas(&allp2updating, 0, 1) {
+				stopTheWorld("GOMAXPROCS")
+				ntotalprocs = totalprocs + 64
+				startTheWorld()
+				atomic.Cas(&allp2updating, 1, 0)
+			}
+			Gosched()
+		}
+		goto again
+	}
+	unlock(&sched.lock)
+
+	_g_.m.locks++
+	if _g_.m.lockedp != 0 {
+		panic("DedicateOSThread nested")
+	}
+
+	_g_.m.lockedExt++
+	if _g_.m.lockedExt == 0 {
+		_g_.m.lockedExt--
+		panic("DedicateOSThread/LockOSThread nesting overflow")
+	}
+	dolockOSThread()
+
+	oldp := releasep()
+	systemstack(func() {
+		handoffp(oldp)
+		acquirep(newp)
+	})
+
+	_m_ := _g_.m
+	newp.lockedm.set(_m_)
+	_m_.lockedp.set(newp)
+	_g_.m.locks--
+}
+
+func UndedicateOSThread() {
+	_g_ := getg()
+
+	if _g_.m.lockedp == 0 {
+		throw("UndedicateOSThread: unlocked m")
+	}
+	if _g_.m.lockedExt == 0 {
+		throw("UndedicateOSThread: unlocked g")
+	}
+	if _g_.m.spinning {
+		throw("UndedicateOSThread: m is spinning")
+	}
+
+	_p_ := _g_.m.lockedp.ptr()
+
+	_g_.m.lockedp = 0
+	_p_.lockedm = 0
+	_g_.m.lockedExt--
+	dounlockOSThread()
+
+	lock(&sched.lock)
+	oldp := releasep()
+	if oldp != _p_ {
+		print("UndedicateOSThread: oldp (", oldp.id, ") != _p_ (", _p_.id, ")\n")
+		throw("UndedicateOSThread: wrong p")
+	}
+	_p_ = pidleget()
+	if _p_ != nil {
+		systemstack(func() {
+			acquirep(_p_)
+		})
+	}
+	if sched.gcwaiting != 0 {
+		oldp.status = _Pgcstop
+		sched.stopwait--
+		if sched.stopwait == 0 {
+			notewakeup(&sched.stopnote)
+		}
+	} else {
+		systemstack(func() {
+			if oldp.runSafePointFn != 0 && atomic.Cas(&oldp.runSafePointFn, 1, 0) {
+				sched.safePointFn(oldp)
+				sched.safePointWait--
+				if sched.safePointWait == 0 {
+					notewakeup(&sched.safePointNote)
+				}
+			}
+		})
+		pidleput2(oldp)
+	}
+	unlock(&sched.lock)
+
+	if _p_ == nil {
+		mcall(func(gp *g) {
+			casgstatus(gp, _Grunning, _Grunnable)
+			dropg()
+			lock(&sched.lock)
+			globrunqput(gp)
+			unlock(&sched.lock)
+			stopm()
+			schedule()
+		})
+	}
 }
 
 //go:nosplit
@@ -3932,6 +4211,7 @@ func (pp *p) init(id int32) {
 //
 // sched.lock must be held and the world must be stopped.
 func (pp *p) destroy() {
+	throw("destroy: not supported")
 	// Move all runnable goroutines to the global queue
 	for pp.runqhead != pp.runqtail {
 		// Pop from tail of local queue
@@ -4031,7 +4311,7 @@ func procresize(nprocs int32) *p {
 	}
 
 	_g_ := getg()
-	if _g_.m.p != 0 && _g_.m.p.ptr().id < nprocs {
+	if _g_.m.p != 0 && (_g_.m.p.ptr().id < nprocs || _g_.m.p.ptr().id >= _gomaxprocs) {
 		// continue to use the current P
 		_g_.m.p.ptr().status = _Prunning
 		_g_.m.p.ptr().mcache.prepareForSweep()
@@ -4094,6 +4374,37 @@ func procresize(nprocs int32) *p {
 	stealOrder.reset(uint32(nprocs))
 	var int32p *int32 = &gomaxprocs // make compiler check that gomaxprocs is an int32
 	atomic.Store((*uint32)(unsafe.Pointer(int32p)), uint32(nprocs))
+
+	if ntotalprocs != 0 {
+		nallp2 := make([]*p, ntotalprocs-gomaxprocs)
+		copy(nallp2, allp2[:cap(allp2)])
+		allp2 = nallp2
+		for i := totalprocs; i < ntotalprocs; i++ {
+			pp := new(p)
+			pp.init(i)
+			atomicstorep(unsafe.Pointer(&allp2[i-gomaxprocs]), unsafe.Pointer(pp))
+		}
+		totalprocs = ntotalprocs
+		ntotalprocs = 0
+	}
+
+	for i := totalprocs-gomaxprocs-1; i >= 0; i-- {
+		p := allp2[i]
+		if _g_.m.p.ptr() == p {
+			continue
+		}
+		if p.m != 0 {
+			print("procresize: p.m != 0, p.id=", p.id, " p.status=", p.status, "\n")
+			throw("procresize: p.m != 0")
+		}
+		p.status = _Pidle
+		if p.lockedm == 0 {
+			pidleput2(p)
+		} else {
+			pidleput3(p)
+		}
+	}
+
 	return runnablePs
 }
 
@@ -4127,6 +4438,9 @@ func acquirep(_p_ *p) {
 func wirep(_p_ *p) {
 	_g_ := getg()
 
+	if _g_.m.lockedp != 0 && _g_.m.lockedp.ptr() != _p_ {
+		throw("wirep: wrong p")
+	}
 	if _g_.m.p != 0 || _g_.m.mcache != nil {
 		throw("wirep: already in go")
 	}
@@ -4355,6 +4669,9 @@ func sysmon() {
 		} else {
 			idle++
 		}
+		if sched.runqsize != 0 {
+			wakep()
+		}
 		// check if we need to force a GC
 		if t := (gcTrigger{kind: gcTriggerTime, now: now}); t.test() && atomic.Load(&forcegc.idle) != 0 {
 			lock(&forcegc.lock)
@@ -4459,6 +4776,14 @@ func retake(now int64) uint32 {
 func preemptall() bool {
 	res := false
 	for _, _p_ := range allp {
+		if _p_.status != _Prunning {
+			continue
+		}
+		if preemptone(_p_) {
+			res = true
+		}
+	}
+	for _, _p_ := range allp2 {
 		if _p_.status != _Prunning {
 			continue
 		}
@@ -4588,6 +4913,9 @@ func schedtrace(detailed bool) {
 // This does not stop already running user goroutines, so the caller
 // should first stop the world when disabling user goroutines.
 func schedEnableUser(enable bool) {
+	if !enable {
+		throw("schedEnableUser: disable scheduling")
+	}
 	lock(&sched.lock)
 	if sched.disable.user == !enable {
 		unlock(&sched.lock)
@@ -4701,12 +5029,35 @@ func globrunqget(_p_ *p, max int32) *g {
 // May run during STW, so write barriers are not allowed.
 //go:nowritebarrierrec
 func pidleput(_p_ *p) {
+	if _p_.lockedm != 0 {
+		throw("pidleput: p is locked")
+	}
 	if !runqempty(_p_) {
 		throw("pidleput: P has non-empty run queue")
 	}
 	_p_.link = sched.pidle
 	sched.pidle.set(_p_)
 	atomic.Xadd(&sched.npidle, 1) // TODO: fast atomic
+}
+
+//go:nowritebarrierrec
+func pidleput2(_p_ *p) {
+	if _p_.status != _Pidle {
+		print("pidleput2: p.status=", _p_.status, "\n")
+		throw("pidleput2: p status != _Pidle")
+	}
+	_p_.link = sched.pidle2
+	sched.pidle2.set(_p_)
+}
+
+//go:nowritebarrierrec
+func pidleput3(_p_ *p) {
+	if _p_.status != _Pidle {
+		print("pidleput3: p.status=", _p_.status, "\n")
+		throw("pidleput3: p status != _Pidle")
+	}
+	_p_.link = sched.pidle3
+	sched.pidle3.set(_p_)
 }
 
 // Try get a p from _Pidle list.
@@ -4720,6 +5071,30 @@ func pidleget() *p {
 		atomic.Xadd(&sched.npidle, -1) // TODO: fast atomic
 	}
 	return _p_
+}
+
+//go:nowritebarrierrec
+func pidleget2() *p {
+	_p_ := sched.pidle2.ptr()
+	if _p_ != nil {
+		sched.pidle2 = _p_.link
+	}
+	return _p_
+}
+
+//go:nowritebarrierrec
+func pidleget3(_p_ *p) *p {
+	pp := &sched.pidle3
+	p := sched.pidle3.ptr()
+	for p != nil {
+		if p == _p_ {
+			*pp = p.link
+			break
+		}
+		pp = &p.link
+		p = p.link.ptr()
+	}
+	return p
 }
 
 // runqempty reports whether _p_ has no Gs on its local run queue.
@@ -4756,6 +5131,10 @@ const randomizeScheduler = raceenabled
 // If the run queue is full, runnext puts g on the global queue.
 // Executed only by the owner P.
 func runqput(_p_ *p, gp *g, next bool) {
+	if _p_.lockedm != 0 || _p_.id >= _gomaxprocs {
+		throw("runqput: p is locked")
+	}
+
 	if randomizeScheduler && next && fastrand()%2 == 0 {
 		next = false
 	}
@@ -4918,6 +5297,9 @@ func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool
 // and put onto local runnable queue of p.
 // Returns one of the stolen elements (or nil if failed).
 func runqsteal(_p_, p2 *p, stealRunNextG bool) *g {
+	if _p_.lockedm != 0 || p2.lockedm != 0 {
+		throw("runqsteal: p is locked")
+	}
 	t := _p_.runqtail
 	n := runqgrab(p2, &_p_.runq, t, stealRunNextG)
 	if n == 0 {
