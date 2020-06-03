@@ -144,6 +144,12 @@ const (
 	// stripped of its resources, though a few things remain
 	// (e.g., trace buffers).
 	_Pdead
+
+	// _Pidle3 means a locked P is paused.
+	_Pidle3
+
+	// _Psafepoint means a locked P is running safe point function.
+	_Psafepoint
 )
 
 // Mutual exclusion locks.  In the uncontended case,
@@ -623,7 +629,6 @@ type schedt struct {
 
 	ngsys uint32 // number of system goroutines; updated atomically
 
-	pidle3     puintptr
 	pidle2     puintptr
 	pidle      puintptr // idle p's
 	npidle     uint32
