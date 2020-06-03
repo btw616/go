@@ -3740,25 +3740,23 @@ func UndedicateOSThread() {
 		throw("UndedicateOSThread: m is spinning")
 	}
 
-	_p_ := _g_.m.lockedp.ptr()
-
-	_g_.m.lockedp = 0
-	_p_.lockedm = 0
-	_g_.m.lockedExt--
-	dounlockOSThread()
-
 	lock(&sched.lock)
+	_p_ := _g_.m.lockedp.ptr()
 	oldp := releasep()
 	if oldp != _p_ {
 		print("UndedicateOSThread: oldp (", oldp.id, ") != _p_ (", _p_.id, ")\n")
 		throw("UndedicateOSThread: wrong p")
 	}
-	_p_ = pidleget()
-	if _p_ != nil {
+	_g_.m.lockedp = 0
+	_p_.lockedm = 0
+	newp := pidleget()
+	if newp != nil {
 		systemstack(func() {
-			acquirep(_p_)
+			acquirep(newp)
 		})
 	}
+	_g_.m.lockedExt--
+	dounlockOSThread()
 	if sched.gcwaiting != 0 {
 		oldp.status = _Pgcstop
 		sched.stopwait--
@@ -3779,7 +3777,7 @@ func UndedicateOSThread() {
 	}
 	unlock(&sched.lock)
 
-	if _p_ == nil {
+	if newp == nil {
 		mcall(func(gp *g) {
 			casgstatus(gp, _Grunning, _Grunnable)
 			dropg()
